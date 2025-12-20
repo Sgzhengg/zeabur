@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+llama-parse
+qdrant-client
+langchain-text-splitters
+fastembed
