@@ -6,7 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from llama_parse import LlamaParse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
-# 引入重排序库
 from flashrank import Ranker, RerankRequest
 
 # --- 1. 环境变量读取 ---
@@ -14,7 +13,6 @@ LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# 集合名称
 COLLECTION_NAME = "telecom_collection_v2"
 
 print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY_LEN={len(LLAMA_CLOUD_API_KEY) if LLAMA_CLOUD_API_KEY else 0}")
@@ -36,7 +34,6 @@ app.add_middleware(
 if not QDRANT_URL:
     raise ValueError("❌ Fatal Error: QDRANT_URL is missing!")
 
-# 初始化 Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
 @app.on_event("startup")
@@ -54,7 +51,6 @@ def health_check():
 
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
-    """入库接口"""
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set on server.")
 
@@ -116,7 +112,6 @@ async def delete_file(file_id: str = Form(...)):
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
-    """高级检索接口"""
     try:
         print(f"🔎 Searching for: {query}")
         
@@ -140,11 +135,9 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        # 3. 重排序 (修正了这里的方法名)
+        # 3. 重排序
         print(f"⚖️ Reranking {len(passages)} documents...")
         rerank_request = RerankRequest(query=query, passages=passages)
-        
-        # 🔴 关键修正：从 .rank() 改为 .rerank()
         ranked_results = reranker.rerank(rerank_request)
 
         # 4. 截取
@@ -155,7 +148,7 @@ async def search_docs(query: str = Form(...), limit: int = 5):
         return [
             {
                 "content": res["text"],
-                "score": res["score"],
+                "score": float(res["score"]), # 🔴 关键修复：强制转为 float
                 "metadata": res["meta"]
             } 
             for res in top_results
