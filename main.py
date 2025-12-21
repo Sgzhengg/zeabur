@@ -7,15 +7,14 @@ from llama_parse import LlamaParse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 
-# --- 恢复为读取环境变量 ---
-# 这样代码就通用了，Key 都在 Zeabur 界面里管理
+# --- 环境变量读取 ---
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") 
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-COLLECTION_NAME = "telecom_collection"
+# 🔴 修改 1: 改个新名字，避开旧的那个格式错误的集合
+COLLECTION_NAME = "telecom_collection_v2"
 
-# 增加一个启动前的打印检查，方便看日志调试
 print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY_LEN={len(LLAMA_CLOUD_API_KEY) if LLAMA_CLOUD_API_KEY else 0}")
 
 app = FastAPI()
@@ -27,26 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 初始化 Qdrant
-# 如果环境变量没读到，这里会报错，正好帮我们发现问题
 if not QDRANT_URL:
-    raise ValueError("❌ Fatal Error: QDRANT_URL is missing in environment variables!")
+    raise ValueError("❌ Fatal Error: QDRANT_URL is missing!")
 
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
 @app.on_event("startup")
 def startup_event():
     print(f"🚀 Connecting to Qdrant at: {QDRANT_URL} ...")
+    # 🔴 修改 2: 彻底删除这里的 create_collection 逻辑
+    # 我们只检查连接，不手动创建集合。让 ingest 时的 client.add 自动去创建。
     try:
-        if not client.collection_exists(COLLECTION_NAME):
-            print(f"Collection {COLLECTION_NAME} not found, creating...")
-            client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE)
-            )
-            print(f"✅ Collection {COLLECTION_NAME} created successfully.")
-        else:
-            print(f"✅ Collection {COLLECTION_NAME} exists. Ready.")
+        collections = client.get_collections()
+        print(f"✅ Connected! Found {len(collections.collections)} collections.")
     except Exception as e:
         print(f"❌ Connection Failed! Error: {e}")
 
@@ -56,7 +48,6 @@ def health_check():
 
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
-    # 双重检查
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set on server.")
 
@@ -80,6 +71,9 @@ async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
         chunks = splitter.split_text(markdown_text)
         
         print(f"Upserting {len(chunks)} chunks...")
+        
+        # 🟢 关键点：client.add 会检测集合是否存在。
+        # 如果不存在，它会自动按照 FastEmbed 的标准创建集合，这就避免了参数冲突。
         client.add(
             collection_name=COLLECTION_NAME,
             documents=chunks,
