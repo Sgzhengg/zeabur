@@ -7,68 +7,58 @@ from llama_parse import LlamaParse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 
-# --- 1. 环境变量配置 (关键修改) ---
-# Zeabur 部署必须通过环境变量设置这些值，否则启动报错
+# --- 恢复为读取环境变量 ---
+# 这样代码就通用了，Key 都在 Zeabur 界面里管理
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") 
+
 COLLECTION_NAME = "telecom_collection"
 
-# 检查必要变量，如果没有则报错，避免盲目启动
-if not QDRANT_URL:
-    print("❌ ERROR: QDRANT_URL is missing. Please set it in Zeabur Variables.")
-    # 这里的默认值仅用于本地测试，Zeabur 上请务必设置环境变量
-    QDRANT_URL = "http://qdrant:6333" 
-
-if not LLAMA_CLOUD_API_KEY:
-    print("⚠️ WARNING: LLAMA_CLOUD_API_KEY is missing. Ingest will fail.")
+# 增加一个启动前的打印检查，方便看日志调试
+print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY_LEN={len(LLAMA_CLOUD_API_KEY) if LLAMA_CLOUD_API_KEY else 0}")
 
 app = FastAPI()
 
-# --- 2. CORS 设置 ---
 app.add_middleware(
     CORSMiddleware,
-    # 生产环境建议将 "*" 改为你的前端域名 (如 https://xxx.zeabur.app)
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 3. 初始化 Qdrant 客户端 ---
+# 初始化 Qdrant
+# 如果环境变量没读到，这里会报错，正好帮我们发现问题
+if not QDRANT_URL:
+    raise ValueError("❌ Fatal Error: QDRANT_URL is missing in environment variables!")
+
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
 @app.on_event("startup")
 def startup_event():
-    """启动时检查并创建集合"""
-    print(f"Connecting to Qdrant at: {QDRANT_URL} ...")
+    print(f"🚀 Connecting to Qdrant at: {QDRANT_URL} ...")
     try:
         if not client.collection_exists(COLLECTION_NAME):
             print(f"Collection {COLLECTION_NAME} not found, creating...")
-            # 注意：这里我们使用 FastEmbed (BAAI/bge-small-en-v1.5)，它的固定维度是 384
             client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE)
             )
-            print(f"Collection {COLLECTION_NAME} created successfully.")
+            print(f"✅ Collection {COLLECTION_NAME} created successfully.")
         else:
-            print(f"Collection {COLLECTION_NAME} exists. Ready to go.")
+            print(f"✅ Collection {COLLECTION_NAME} exists. Ready.")
     except Exception as e:
-        print(f"⚠️ Connection Warning: Could not connect to Qdrant at startup.")
-        print(f"Details: {e}")
-        print("Service will start, but database operations might fail.")
+        print(f"❌ Connection Failed! Error: {e}")
 
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "Telecom Ingest API"}
 
 @app.post("/ingest")
-# 关键修复：这里加了 File(...) 确保 Swagger 显示文件上传按钮
 async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
-    """接收文件 -> 解析 -> 切片 -> 向量化 -> 入库"""
-    
-    # 再次检查 Key
+    # 双重检查
     if not LLAMA_CLOUD_API_KEY:
-        raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set on server.")
+         raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set on server.")
 
     temp_filename = f"/tmp/{uuid.uuid4()}_{file.filename}"
     try:
@@ -90,7 +80,6 @@ async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
         chunks = splitter.split_text(markdown_text)
         
         print(f"Upserting {len(chunks)} chunks...")
-        # FastEmbed 会自动下载模型并生成向量
         client.add(
             collection_name=COLLECTION_NAME,
             documents=chunks,
@@ -109,7 +98,6 @@ async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
 
 @app.post("/delete")
 async def delete_file(file_id: str = Form(...)):
-    """根据 file_id 删除数据"""
     try:
         client.delete(
             collection_name=COLLECTION_NAME,
@@ -130,7 +118,6 @@ async def delete_file(file_id: str = Form(...)):
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
-    """搜索接口"""
     try:
         results = client.query(
             collection_name=COLLECTION_NAME,
@@ -140,5 +127,3 @@ async def search_docs(query: str = Form(...), limit: int = 5):
         return [{"content": res.document, "score": res.score, "metadata": res.metadata} for res in results]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# 注意：这里删除了 if __name__ == "__main__"，因为我们现在用 Procfile 启动
