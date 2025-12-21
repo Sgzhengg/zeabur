@@ -1,7 +1,7 @@
 import os
 import uuid
 import traceback
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Form, HTTPException,File
 from fastapi.middleware.cors import CORSMiddleware
 from llama_parse import LlamaParse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -55,7 +55,7 @@ def health_check():
     return {"status": "ok", "service": "Telecom Ingest API"}
 
 @app.post("/ingest")
-async def ingest_file(file: UploadFile, file_id: str = Form(...)):
+async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
     """接收文件 -> LlamaParse -> 切片 -> 本地向量化 -> 存入 Qdrant"""
     temp_filename = f"/tmp/{uuid.uuid4()}_{file.filename}"
     try:
