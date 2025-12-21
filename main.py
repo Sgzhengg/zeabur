@@ -14,15 +14,13 @@ LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# 集合名称 (保持与上次一致，如果你上次改了 v2，这里也用 v2)
+# 集合名称
 COLLECTION_NAME = "telecom_collection_v2"
 
 print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY_LEN={len(LLAMA_CLOUD_API_KEY) if LLAMA_CLOUD_API_KEY else 0}")
 
 # --- 2. 初始化 Re-ranker ---
-# 这一步会自动下载轻量级排序模型 (约40MB)，存放在 /tmp 下
-# ms-marco-MiniLM-L-12-v2 是目前速度和效果平衡最好的 CPU 模型
-print("⏳ Initializing FlashRank Reranker (this may take a few seconds)...")
+print("⏳ Initializing FlashRank Reranker...")
 reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank_cache")
 print("✅ Reranker initialized!")
 
@@ -56,7 +54,7 @@ def health_check():
 
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
-    """入库接口：解析 -> 切片 -> 向量化存储"""
+    """入库接口"""
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set on server.")
 
@@ -80,7 +78,6 @@ async def ingest_file(file: UploadFile = File(...), file_id: str = Form(...)):
         chunks = splitter.split_text(markdown_text)
         
         print(f"Upserting {len(chunks)} chunks...")
-        # client.add 会自动处理向量化和集合创建
         client.add(
             collection_name=COLLECTION_NAME,
             documents=chunks,
@@ -119,16 +116,11 @@ async def delete_file(file_id: str = Form(...)):
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
-    """
-    高级检索接口：
-    1. 向量检索召回 50 条 (Recall)
-    2. FlashRank 精排前 limit 条 (Rerank)
-    """
+    """高级检索接口"""
     try:
         print(f"🔎 Searching for: {query}")
         
-        # --- 第一步：扩大召回 (Vector Search) ---
-        # 我们故意取 limit * 10 (比如50条)，保证相关内容都在候选池里
+        # 1. 扩大召回
         search_result = client.query(
             collection_name=COLLECTION_NAME,
             query_text=query,
@@ -138,7 +130,7 @@ async def search_docs(query: str = Form(...), limit: int = 5):
         if not search_result:
             return []
 
-        # 转换为 FlashRank 需要的格式
+        # 2. 格式化
         passages = [
             {
                 "id": str(res.id), 
@@ -148,13 +140,14 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        # --- 第二步：重排序 (Reranking) ---
+        # 3. 重排序 (修正了这里的方法名)
         print(f"⚖️ Reranking {len(passages)} documents...")
         rerank_request = RerankRequest(query=query, passages=passages)
-        ranked_results = reranker.rank(rerank_request)
+        
+        # 🔴 关键修正：从 .rank() 改为 .rerank()
+        ranked_results = reranker.rerank(rerank_request)
 
-        # --- 第三步：截取并返回 ---
-        # 截取分数最高的 Top N
+        # 4. 截取
         top_results = ranked_results[:limit]
         
         print(f"✅ Return top {len(top_results)} results.")
@@ -171,3 +164,4 @@ async def search_docs(query: str = Form(...), limit: int = 5):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+        
