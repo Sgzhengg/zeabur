@@ -5,3 +5,4 @@ llama-parse
 qdrant-client
 langchain-text-splitters
 fastembed
+flashrank
