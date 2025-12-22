@@ -190,9 +190,13 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
             shutil.rmtree(base_tmp_dir)
 
 @app.post("/delete")
-async def delete_package(group_id: str = Form(...)):
-    """按 Group ID 删除整套文档"""
+async def delete_package(target_id: str = Form(..., description="填入 group_id 或 file_id")):
+    """
+    智能删除接口：会自动尝试删除匹配 group_id 或 file_id 的数据
+    兼容旧版本数据
+    """
     try:
+        # 尝试删除 group_id 匹配的数据 (新版逻辑)
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.FilterSelector(
@@ -200,13 +204,46 @@ async def delete_package(group_id: str = Form(...)):
                     must=[
                         models.FieldCondition(
                             key="group_id",
-                            match=models.MatchValue(value=group_id)
+                            match=models.MatchValue(value=target_id)
                         )
                     ]
                 )
             )
         )
-        return {"status": "deleted", "group_id": group_id}
+
+        # 尝试删除 file_id 匹配的数据 (兼容旧版逻辑)
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="file_id",
+                            match=models.MatchValue(value=target_id)
+                        )
+                    ]
+                )
+            )
+        )
+        return {"status": "deleted", "target_id": target_id, "msg": "Attempted delete by group_id and file_id"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reset")
+async def reset_database():
+    """
+    🧨 核弹接口：清空当前集合的所有数据！
+    仅用于开发测试阶段
+    """
+    try:
+        # 1. 删除集合
+        client.delete_collection(COLLECTION_NAME)
+        # 2. 重新创建
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE)
+        )
+        return {"status": "success", "msg": f"Collection {COLLECTION_NAME} has been completely reset."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
