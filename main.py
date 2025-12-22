@@ -13,14 +13,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 from flashrank import Ranker, RerankRequest
 
-# --- 1. 环境变量读取 ---
+# --- 1. 环境变量 ---
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 COLLECTION_NAME = "telecom_collection_v2"
-
-print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY={LLAMA_CLOUD_API_KEY[:5]}...")
 
 # --- 2. 初始化 Re-ranker ---
 print("⏳ Initializing FlashRank Reranker...")
@@ -52,7 +50,7 @@ def startup_event():
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Telecom Ingest API with Rerank"}
+    return {"status": "ok", "service": "Telecom Ingest API Fixed"}
 
 # --- 辅助函数 ---
 def extract_zip(zip_path: str, extract_to: str):
@@ -92,12 +90,12 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
         else:
             files_to_process.append(upload_path)
 
+        # 🔴 关键修正：删除了 language="zh"，让它自动检测，防止 422 报错
         parser = LlamaParse(
             api_key=LLAMA_CLOUD_API_KEY,
             result_type="markdown",
             premium_mode=True, 
-            verbose=True,
-            language="zh"
+            verbose=True
         )
 
         total_chunks = 0
@@ -108,8 +106,15 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
             doc_type = guess_doc_type(fname)
             print(f"📄 Parsing: {fname}")
             
-            documents = await parser.aload_data(file_path)
-            if not documents: continue
+            try:
+                documents = await parser.aload_data(file_path)
+            except Exception as parse_error:
+                print(f"❌ Parse Error on {fname}: {parse_error}")
+                continue # 跳过解析失败的文件
+
+            if not documents: 
+                print(f"⚠️ Warning: No text found in {fname}")
+                continue
                 
             markdown_text = documents[0].text
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -128,13 +133,16 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
                 })
             total_chunks += len(chunks)
 
+        # 🔴 安全检查：如果没有任何切片生成，说明入库彻底失败，返回错误
+        if total_chunks == 0:
+            return {"status": "error", "msg": "No documents were parsed successfully. Check server logs."}
+
         if all_points:
             print(f"💾 Upserting {len(all_points)} chunks...")
             texts = [p["content"] for p in all_points]
             metadatas = [p["metadata"] for p in all_points]
             ids = [str(uuid.uuid4()) for _ in all_points]
 
-            # 🟢 这里的 add 会自动根据模型配置正确的集合结构
             client.add(
                 collection_name=COLLECTION_NAME,
                 documents=texts,
@@ -152,7 +160,7 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
             shutil.rmtree(base_tmp_dir)
 
 @app.post("/delete")
-async def delete_package(target_id: str = Form(..., description="填入 group_id 或 file_id")):
+async def delete_package(target_id: str = Form(...)):
     try:
         if not client.collection_exists(COLLECTION_NAME):
              return {"status": "skipped", "msg": "Collection does not exist."}
@@ -165,7 +173,6 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
                 )
             )
         )
-        # 兼容旧 file_id
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.FilterSelector(
@@ -180,21 +187,15 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
 
 @app.post("/reset")
 async def reset_database():
-    """
-    🧨 修正版：只负责删除，不负责重建。
-    让 ingest 接口根据数据自动重建，避免配置不匹配。
-    """
     try:
         client.delete_collection(COLLECTION_NAME)
-        return {"status": "success", "msg": "Collection deleted. It will be recreated automatically on next ingest."}
+        return {"status": "success", "msg": "Collection deleted."}
     except Exception as e:
-        # 如果集合本来就不存在，忽略错误
         return {"status": "success", "msg": "Collection already clear."}
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
     try:
-        # 🟢 修正：先检查集合是否存在，如果不存在（刚Reset完），直接返回空，不报错
         if not client.collection_exists(COLLECTION_NAME):
             return []
 
@@ -214,7 +215,6 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        print(f"⚖️ Reranking {len(passages)} documents...")
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked_results = reranker.rerank(rerank_request)
 
