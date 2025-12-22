@@ -18,10 +18,9 @@ LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# 集合名称 (保持不变)
 COLLECTION_NAME = "telecom_collection_v2"
 
-print(f"DEBUG CONFIG: URL={QDRANT_URL}")
+print(f"DEBUG CONFIG: URL={QDRANT_URL}, LLAMA_KEY={LLAMA_CLOUD_API_KEY[:5]}...")
 
 # --- 2. 初始化 Re-ranker ---
 print("⏳ Initializing FlashRank Reranker...")
@@ -40,7 +39,6 @@ app.add_middleware(
 if not QDRANT_URL:
     raise ValueError("❌ Fatal Error: QDRANT_URL is missing!")
 
-# 初始化 Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
 @app.on_event("startup")
@@ -54,16 +52,14 @@ def startup_event():
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Telecom Complex Ingest API"}
+    return {"status": "ok", "service": "Telecom Ingest API with Rerank"}
 
-# --- 辅助函数：解压 ZIP ---
+# --- 辅助函数 ---
 def extract_zip(zip_path: str, extract_to: str):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
-# --- 辅助函数：判断文件是主件还是附件 ---
 def guess_doc_type(filename: str) -> str:
-    # 简单的启发式规则，可根据电信业务习惯修改
     main_keywords = ["通知", "公告", "管理办法", "规定", "主件", "正文"]
     if any(k in filename for k in main_keywords):
         return "main"
@@ -71,102 +67,74 @@ def guess_doc_type(filename: str) -> str:
 
 @app.post("/ingest")
 async def ingest_package(file: UploadFile = File(...), package_id: str = Form(None)):
-    """
-    高级入库接口：
-    支持上传 .zip 压缩包（包含主件+附件）或 单个文件。
-    """
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set.")
 
-    # 如果没传 ID，生成一个新的 Group ID (案卷ID)
     group_id = package_id if package_id else str(uuid.uuid4())
-    
-    # 临时目录
     base_tmp_dir = f"/tmp/ingest_{group_id}"
     os.makedirs(base_tmp_dir, exist_ok=True)
-    
     upload_path = f"{base_tmp_dir}/{file.filename}"
     
     try:
-        # 1. 保存上传的文件
         content = await file.read()
         with open(upload_path, "wb") as f:
             f.write(content)
         
         files_to_process = []
-
-        # 2. 判断是否为 ZIP
         if file.filename.lower().endswith(".zip"):
-            print(f"📦 Detected ZIP package: {file.filename}, extracting...")
+            print(f"📦 Detected ZIP package: {file.filename}")
             extract_dir = f"{base_tmp_dir}/extracted"
             extract_zip(upload_path, extract_dir)
-            
-            # 遍历解压后的所有文件
             for root, dirs, files in os.walk(extract_dir):
                 for fname in files:
-                    if fname.startswith(".") or "__MACOSX" in root: continue # 跳过系统隐藏文件
+                    if fname.startswith(".") or "__MACOSX" in root: continue
                     files_to_process.append(os.path.join(root, fname))
         else:
-            # 单文件
             files_to_process.append(upload_path)
 
-        print(f"task: Processing {len(files_to_process)} files in Group: {group_id}")
-
-        # 3. 初始化 LlamaParse (开启高级模式以处理复杂表格)
         parser = LlamaParse(
             api_key=LLAMA_CLOUD_API_KEY,
             result_type="markdown",
-            premium_mode=True,  # ⚠️ 开启高级模式，解析表格更准 (会消耗 Credit)
+            premium_mode=True, 
             verbose=True,
-            language="zh"       # 强制中文识别
+            language="zh"
         )
 
         total_chunks = 0
-        all_points = [] # 暂时存放所有切片，最后一起入库
+        all_points = [] 
 
-        # 4. 循环处理每个文件
         for file_path in files_to_process:
             fname = os.path.basename(file_path)
-            doc_type = guess_doc_type(fname) # 识别是主件还是附件
+            doc_type = guess_doc_type(fname)
+            print(f"📄 Parsing: {fname}")
             
-            print(f"📄 Parsing ({doc_type}): {fname} ...")
-            
-            # LlamaParse 解析
             documents = await parser.aload_data(file_path)
-            if not documents:
-                print(f"⚠️ Warning: No text found in {fname}")
-                continue
+            if not documents: continue
                 
             markdown_text = documents[0].text
-            
-            # 切片
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             chunks = splitter.split_text(markdown_text)
             
-            # 准备入库数据 (携带 Group ID 和 类型)
             for i, chunk_text in enumerate(chunks):
                 all_points.append({
                     "content": chunk_text,
                     "metadata": {
-                        "group_id": group_id,     # 核心：关联ID
+                        "group_id": group_id,
                         "filename": fname,
-                        "doc_type": doc_type,     # main 或 attachment
+                        "doc_type": doc_type,
                         "chunk_index": i,
                         "source_package": file.filename
                     }
                 })
-            
             total_chunks += len(chunks)
 
-        # 5. 批量入库
         if all_points:
-            print(f"💾 Upserting {len(all_points)} total chunks to Qdrant...")
-            
-            # 提取文本列表用于向量化
+            print(f"💾 Upserting {len(all_points)} chunks...")
             texts = [p["content"] for p in all_points]
             metadatas = [p["metadata"] for p in all_points]
             ids = [str(uuid.uuid4()) for _ in all_points]
 
+            # 🟢 这里的 add 会自动根据模型配置正确的集合结构
             client.add(
                 collection_name=COLLECTION_NAME,
                 documents=texts,
@@ -174,85 +142,62 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
                 ids=ids
             )
         
-        return {
-            "status": "success", 
-            "group_id": group_id, 
-            "files_processed": len(files_to_process),
-            "total_chunks": total_chunks
-        }
+        return {"status": "success", "group_id": group_id, "chunks": total_chunks}
         
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # 清理临时目录
         if os.path.exists(base_tmp_dir):
             shutil.rmtree(base_tmp_dir)
 
 @app.post("/delete")
 async def delete_package(target_id: str = Form(..., description="填入 group_id 或 file_id")):
-    """
-    智能删除接口：会自动尝试删除匹配 group_id 或 file_id 的数据
-    兼容旧版本数据
-    """
     try:
-        # 尝试删除 group_id 匹配的数据 (新版逻辑)
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="group_id",
-                            match=models.MatchValue(value=target_id)
-                        )
-                    ]
-                )
-            )
-        )
+        if not client.collection_exists(COLLECTION_NAME):
+             return {"status": "skipped", "msg": "Collection does not exist."}
 
-        # 尝试删除 file_id 匹配的数据 (兼容旧版逻辑)
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.FilterSelector(
                 filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="file_id",
-                            match=models.MatchValue(value=target_id)
-                        )
-                    ]
+                    must=[models.FieldCondition(key="group_id", match=models.MatchValue(value=target_id))]
                 )
             )
         )
-        return {"status": "deleted", "target_id": target_id, "msg": "Attempted delete by group_id and file_id"}
+        # 兼容旧 file_id
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[models.FieldCondition(key="file_id", match=models.MatchValue(value=target_id))]
+                )
+            )
+        )
+        return {"status": "deleted", "target_id": target_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset")
 async def reset_database():
     """
-    🧨 核弹接口：清空当前集合的所有数据！
-    仅用于开发测试阶段
+    🧨 修正版：只负责删除，不负责重建。
+    让 ingest 接口根据数据自动重建，避免配置不匹配。
     """
     try:
-        # 1. 删除集合
         client.delete_collection(COLLECTION_NAME)
-        # 2. 重新创建
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE)
-        )
-        return {"status": "success", "msg": f"Collection {COLLECTION_NAME} has been completely reset."}
+        return {"status": "success", "msg": "Collection deleted. It will be recreated automatically on next ingest."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # 如果集合本来就不存在，忽略错误
+        return {"status": "success", "msg": "Collection already clear."}
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
-    """
-    检索接口 (保持 FlashRank 重排序逻辑)
-    """
     try:
+        # 🟢 修正：先检查集合是否存在，如果不存在（刚Reset完），直接返回空，不报错
+        if not client.collection_exists(COLLECTION_NAME):
+            return []
+
         print(f"🔎 Searching for: {query}")
         
         search_result = client.query(
@@ -269,13 +214,12 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        # Rerank
+        print(f"⚖️ Reranking {len(passages)} documents...")
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked_results = reranker.rerank(rerank_request)
 
         top_results = ranked_results[:limit]
         
-        # 返回结果 (现在包含了 filename, group_id 等丰富信息)
         return [
             {
                 "content": res["text"],
