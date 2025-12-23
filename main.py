@@ -24,7 +24,6 @@ print(f"DEBUG CONFIG: URL={QDRANT_URL}")
 
 # --- 2. 初始化 Re-ranker ---
 print("⏳ Initializing FlashRank Reranker...")
-# 依然使用这个速度快且效果好的轻量模型
 reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank_cache")
 print("✅ Reranker initialized!")
 
@@ -53,7 +52,7 @@ def startup_event():
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Telecom Ingest API Optimized"}
+    return {"status": "ok", "service": "Telecom Ingest API Optimized V2"}
 
 # --- 辅助函数 ---
 def extract_zip(zip_path: str, extract_to: str):
@@ -68,9 +67,7 @@ def guess_doc_type(filename: str) -> str:
 
 @app.post("/ingest")
 async def ingest_package(file: UploadFile = File(...), package_id: str = Form(None)):
-    """
-    入库接口：支持 ZIP 包，针对电信文档优化了解析指令和切片大小
-    """
+    """入库接口：支持 ZIP 包，针对电信文档优化"""
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set.")
 
@@ -96,7 +93,6 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
         else:
             files_to_process.append(upload_path)
 
-        # 🟢 优化点 1：移除 language="zh" 防止报错，增加解析指令优化表格
         parser = LlamaParse(
             api_key=LLAMA_CLOUD_API_KEY,
             result_type="markdown",
@@ -125,8 +121,7 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
                 
             markdown_text = documents[0].text
             
-            # 🟢 优化点 2：增大 chunk_size 到 2000，overlap 到 500
-            # 这样能保证上下文连贯，解决"不知道是哪个月份"的问题
+            # 切片设置：2000/500
             splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=500)
             chunks = splitter.split_text(markdown_text)
             
@@ -174,7 +169,6 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
         if not client.collection_exists(COLLECTION_NAME):
              return {"status": "skipped", "msg": "Collection does not exist."}
 
-        # 删除 group_id 匹配的
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.FilterSelector(
@@ -183,7 +177,6 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
                 )
             )
         )
-        # 删除 file_id 匹配的 (兼容旧数据)
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.FilterSelector(
@@ -198,7 +191,6 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
 
 @app.post("/reset")
 async def reset_database():
-    """仅删除集合，不重新创建，由 ingest 自动处理重建"""
     try:
         client.delete_collection(COLLECTION_NAME)
         return {"status": "success", "msg": "Collection deleted."}
@@ -208,17 +200,16 @@ async def reset_database():
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
     try:
-        # 防止刚 reset 完报错
         if not client.collection_exists(COLLECTION_NAME):
             return []
 
         print(f"🔎 Searching for: {query}")
         
-        # 🟢 优化点 3：扩大初筛范围到 100 条，宁滥勿缺
+        # 🟢 核心修改：向量初筛扩大到 300 条
         search_result = client.query(
             collection_name=COLLECTION_NAME,
             query_text=query,
-            limit=100 
+            limit=300 
         )
         
         if not search_result:
@@ -229,13 +220,13 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        print(f"⚖️ Reranking {len(passages)} documents...")
+        # FlashRank 重排序
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked_results = reranker.rerank(rerank_request)
 
+        # 截取最终返回数量
         top_results = ranked_results[:limit]
         
-        # 🟢 优化点 4：强制 float 转换，修复 500 报错
         return [
             {
                 "content": res["text"],
