@@ -6,6 +6,9 @@ import traceback
 from pathlib import Path
 from typing import List
 
+# 🟢 引入 Redis 库
+import redis
+
 from fastapi import FastAPI, UploadFile, Form, HTTPException, File
 from fastapi.middleware.cors import CORSMiddleware
 from llama_parse import LlamaParse
@@ -18,9 +21,14 @@ LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
+# 🟢 Redis 配置 (根据你的截图，默认 Host 改为 "redis")
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None) # 如果有密码，请在 Zeabur 变量里设置
+
 COLLECTION_NAME = "telecom_collection_v2"
 
-print(f"DEBUG CONFIG: URL={QDRANT_URL}")
+print(f"DEBUG CONFIG: QDRANT_URL={QDRANT_URL}, REDIS_HOST={REDIS_HOST}")
 
 # --- 2. 初始化 Re-ranker ---
 print("⏳ Initializing FlashRank Reranker...")
@@ -39,6 +47,7 @@ app.add_middleware(
 if not QDRANT_URL:
     raise ValueError("❌ Fatal Error: QDRANT_URL is missing!")
 
+# 初始化 Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
 @app.on_event("startup")
@@ -46,13 +55,13 @@ def startup_event():
     print(f"🚀 Connecting to Qdrant at: {QDRANT_URL} ...")
     try:
         collections = client.get_collections()
-        print(f"✅ Connected! Found {len(collections.collections)} collections.")
+        print(f"✅ Connected to Qdrant! Found {len(collections.collections)} collections.")
     except Exception as e:
-        print(f"❌ Connection Failed! Error: {e}")
+        print(f"❌ Qdrant Connection Failed! Error: {e}")
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Telecom Ingest API Optimized V2"}
+    return {"status": "ok", "service": "Telecom Ingest API (With Redis Reset)"}
 
 # --- 辅助函数 ---
 def extract_zip(zip_path: str, extract_to: str):
@@ -67,7 +76,7 @@ def guess_doc_type(filename: str) -> str:
 
 @app.post("/ingest")
 async def ingest_package(file: UploadFile = File(...), package_id: str = Form(None)):
-    """入库接口：支持 ZIP 包，针对电信文档优化"""
+    """入库接口"""
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set.")
 
@@ -121,7 +130,6 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
                 
             markdown_text = documents[0].text
             
-            # 切片设置：2000/500
             splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=500)
             chunks = splitter.split_text(markdown_text)
             
@@ -191,11 +199,37 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
 
 @app.post("/reset")
 async def reset_database():
+    """
+    一键重置：同时清空 Qdrant 和 Redis
+    """
+    report = []
+    
+    # 1. 清空 Qdrant
     try:
         client.delete_collection(COLLECTION_NAME)
-        return {"status": "success", "msg": "Collection deleted."}
+        report.append("Qdrant collection deleted")
     except Exception as e:
-        return {"status": "success", "msg": "Collection already clear."}
+        # 如果集合本来就不存在，不算错
+        report.append(f"Qdrant skipped ({str(e)})")
+
+    # 2. 🟢 清空 Redis (记忆)
+    try:
+        # 连接到 Redis
+        r = redis.Redis(
+            host=REDIS_HOST, 
+            port=REDIS_PORT, 
+            password=REDIS_PASSWORD, 
+            decode_responses=True,
+            socket_timeout=3 # 设置超时防止卡死
+        )
+        # 执行清空指令
+        r.flushdb()
+        report.append("Redis memory flushed")
+    except Exception as e:
+        print(f"❌ Redis Reset Failed: {e}")
+        report.append(f"Redis failed: {str(e)}")
+
+    return {"status": "success", "details": " | ".join(report)}
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
@@ -205,7 +239,6 @@ async def search_docs(query: str = Form(...), limit: int = 5):
 
         print(f"🔎 Searching for: {query}")
         
-        # 🟢 核心修改：向量初筛扩大到 300 条
         search_result = client.query(
             collection_name=COLLECTION_NAME,
             query_text=query,
@@ -220,11 +253,9 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             for res in search_result
         ]
 
-        # FlashRank 重排序
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked_results = reranker.rerank(rerank_request)
 
-        # 截取最终返回数量
         top_results = ranked_results[:limit]
         
         return [
