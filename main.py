@@ -197,41 +197,54 @@ async def _process_with_element_parser(
         total_stored = 0
 
         # 📌 存储文本节点
+        from qdrant_client.models import PointStruct
+        points_to_upload = []
+
         for i, node in enumerate(base_nodes):
             if node.text.strip():
-                client.add(
-                    collection_name=COLLECTION_NAME,
-                    documents=[node.text],
-                    metadata={
-                        "group_id": group_id,
-                        "filename": filename,
-                        "doc_type": doc_type,
-                        "chunk_type": "text",
-                        "node_index": i,
-                        "source_package": source_package
-                    },
-                    ids=[str(uuid.uuid4())]
+                points_to_upload.append(
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector={},  # Qdrant 会自动生成向量
+                        payload={
+                            "document": node.text,
+                            "group_id": group_id,
+                            "filename": filename,
+                            "doc_type": doc_type,
+                            "chunk_type": "text",
+                            "node_index": i,
+                            "source_package": source_package
+                        }
+                    )
                 )
-                total_stored += 1
 
         # 📌 存储表格对象（完整表格，不被切断！）
         for i, obj in enumerate(objects):
             if obj.text.strip():
-                client.add(
-                    collection_name=TABLES_COLLECTION_NAME,
-                    documents=[obj.text],
-                    metadata={
-                        "group_id": group_id,
-                        "filename": filename,
-                        "doc_type": doc_type,
-                        "chunk_type": "table",
-                        "table_index": i,
-                        "source_package": source_package,
-                        "is_table": True
-                    },
-                    ids=[str(uuid.uuid4())]
+                points_to_upload.append(
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector={},  # Qdrant 会自动生成向量
+                        payload={
+                            "document": obj.text,
+                            "group_id": group_id,
+                            "filename": filename,
+                            "doc_type": doc_type,
+                            "chunk_type": "table",
+                            "table_index": i,
+                            "source_package": source_package,
+                            "is_table": True
+                        }
+                    )
                 )
-                total_stored += 1
+
+        # 批量上传
+        if points_to_upload:
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points_to_upload
+            )
+            total_stored = len(points_to_upload)
 
         print(f"  ✅ Stored {total_stored} chunks (text + tables)")
 
@@ -282,27 +295,41 @@ async def _process_with_fallback(
     chunks = splitter.split_text(markdown_text)
     print(f"  📊 Split into {len(chunks)} chunks")
 
-    total_stored = 0
+    # 🆕 使用批量上传
+    from qdrant_client.models import PointStruct
+    points_to_upload = []
+
     for i, chunk in enumerate(chunks):
         if chunk.strip():
             # 检测是否包含表格
             is_table = "|" in chunk and ("|---" in chunk or "| ===" in chunk)
 
-            client.add(
-                collection_name=COLLECTION_NAME,
-                documents=[chunk],
-                metadata={
-                    "group_id": group_id,
-                    "filename": filename,
-                    "doc_type": doc_type,
-                    "chunk_type": "table" if is_table else "text",
-                    "chunk_index": i,
-                    "source_package": source_package,
-                    "is_table": is_table
-                },
-                ids=[str(uuid.uuid4())]
+            points_to_upload.append(
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={},
+                    payload={
+                        "document": chunk,
+                        "group_id": group_id,
+                        "filename": filename,
+                        "doc_type": doc_type,
+                        "chunk_type": "table" if is_table else "text",
+                        "chunk_index": i,
+                        "source_package": source_package,
+                        "is_table": is_table
+                    }
+                )
             )
-            total_stored += 1
+
+    # 批量上传
+    if points_to_upload:
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points_to_upload
+        )
+        total_stored = len(points_to_upload)
+    else:
+        total_stored = 0
 
     print(f"  ✅ Stored {total_stored} chunks (fallback mode)")
 
@@ -488,10 +515,11 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             )
 
             for res in text_results:
+                # 🆕 从 payload 中提取数据
                 all_results.append({
                     "id": str(res.id),
-                    "text": res.document,
-                    "meta": res.metadata,
+                    "text": res.payload.get("document", res.document),
+                    "meta": res.metadata if hasattr(res, 'metadata') else res.payload,
                     "source": "text"
                 })
 
@@ -505,10 +533,11 @@ async def search_docs(query: str = Form(...), limit: int = 5):
             )
 
             for res in table_results:
+                # 🆕 从 payload 中提取数据
                 all_results.append({
                     "id": str(res.id),
-                    "text": res.document,
-                    "meta": res.metadata,
+                    "text": res.payload.get("document", res.document),
+                    "meta": res.metadata if hasattr(res, 'metadata') else res.payload,
                     "source": "table"  # 🆕 标记来源
                 })
 
