@@ -7,12 +7,7 @@ langchain-text-splitters
 fastembed
 flashrank
 redis
-# 🆕 LlamaIndex 核心包（包含 MarkdownElementNodeParser）
+# 🆕 LlamaIndex（仅核心包，MarkdownElementNodeParser 已包含）
 llama-index-core>=0.10.0
-# 🆕 LlamaParse 集成
-llama-index-readers-llamaparse>=0.1.0
-# 🆕 向量存储和嵌入
-llama-index-vector-stores-qdrant>=0.1.0
-# 🆕 其他依赖
-aiosession>=0.1.0
+# 其他依赖
 pydantic>=2.0.0

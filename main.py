@@ -18,15 +18,16 @@ from pydantic import BaseModel
 
 # 🆕 LlamaIndex 相关导入
 try:
-    from llama_index.core import VectorStoreIndex, StorageContext, Document
+    from llama_index.core import Document
     from llama_index.core.node_parser import MarkdownElementNodeParser
-    from llama_index.embeddings.fastembed import FastEmbedEmbedding
-    from llama_index.vector_stores.qdrant import QdrantVectorStore
     print("✅ LlamaIndex modules imported successfully")
+    HAS_LLAMAINDEX = True
 except ImportError as e:
     print(f"⚠️ Warning: LlamaIndex import error: {e}")
-    print("   Will use fallback mode (no table extraction)")
+    print("   Will use fallback mode (optimized chunking)")
+    HAS_LLAMAINDEX = False
     MarkdownElementNodeParser = None
+    Document = None
 
 # --- 1. 环境变量读取 ---
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
@@ -62,9 +63,6 @@ if not QDRANT_URL:
 
 # 初始化 Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
-
-# 🆕 初始化 Embedding 模型（用于 LlamaIndex）
-embed_model = FastEmbedEmbedding(model_name="BAAI/bge-small-zh-v1.5")
 
 @app.on_event("startup")
 def startup_event():
@@ -155,13 +153,13 @@ async def process_document_with_element_parser(
         doc_type = guess_doc_type(filename)
 
         # 🆕 2. 检查是否可用 MarkdownElementNodeParser
-        if MarkdownElementNodeParser is not None:
+        if HAS_LLAMAINDEX:
             print("  ✨ Using MarkdownElementNodeParser (table extraction mode)")
             return await _process_with_element_parser(
                 markdown_text, filename, group_id, source_package, doc_type
             )
         else:
-            print("  ⚠️ MarkdownElementNodeParser not available, using fallback mode")
+            print("  ⚠️ Using fallback mode (optimized for tables)")
             return await _process_with_fallback(
                 markdown_text, filename, group_id, source_package, doc_type
             )
