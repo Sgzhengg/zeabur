@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 llama-parse
 qdrant-client
@@ -7,10 +7,12 @@ langchain-text-splitters
 fastembed
 flashrank
 redis
-llama-index-core
-llama-index-readers-llama-parse
-llama-index-node-parser
-llama-index-embeddings-fastembed
-llama-index-vector-stores-qdrant
-openai>=1.0.0
+# 🆕 LlamaIndex 核心包（包含 MarkdownElementNodeParser）
+llama-index-core>=0.10.0
+# 🆕 LlamaParse 集成
+llama-index-readers-llamaparse>=0.1.0
+# 🆕 向量存储和嵌入
+llama-index-vector-stores-qdrant>=0.1.0
+# 🆕 其他依赖
+aiosession>=0.1.0
 pydantic>=2.0.0

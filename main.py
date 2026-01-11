@@ -17,11 +17,16 @@ from flashrank import Ranker, RerankRequest
 from pydantic import BaseModel
 
 # 🆕 LlamaIndex 相关导入
-from llama_index.core import VectorStoreIndex, StorageContext
-from llama_index.readers.llama_parse import LlamaParseReader
-from llama_index.core.node_parser import MarkdownElementNodeParser
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
-from llama_index.vector_stores.qdrant import QdrantVectorStore
+try:
+    from llama_index.core import VectorStoreIndex, StorageContext, Document
+    from llama_index.core.node_parser import MarkdownElementNodeParser
+    from llama_index.embeddings.fastembed import FastEmbedEmbedding
+    from llama_index.vector_stores.qdrant import QdrantVectorStore
+    print("✅ LlamaIndex modules imported successfully")
+except ImportError as e:
+    print(f"⚠️ Warning: LlamaIndex import error: {e}")
+    print("   Will use fallback mode (no table extraction)")
+    MarkdownElementNodeParser = None
 
 # --- 1. 环境变量读取 ---
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
@@ -113,7 +118,7 @@ async def process_document_with_element_parser(
     使用 MarkdownElementNodeParser 处理文档
     分别处理文本节点和表格对象
     """
-    print(f"📄 Processing with Element Parser: {filename}")
+    print(f"📄 Processing: {filename}")
 
     # 1. 使用 LlamaParse 解析文档
     parser = LlamaParse(
@@ -147,15 +152,41 @@ async def process_document_with_element_parser(
             return {"success": False, "error": "No documents parsed"}
 
         markdown_text = documents[0].text
+        doc_type = guess_doc_type(filename)
 
-        # 2. 使用 MarkdownElementNodeParser 解析
-        # 🆕 这是关键：它会自动识别表格边界！
+        # 🆕 2. 检查是否可用 MarkdownElementNodeParser
+        if MarkdownElementNodeParser is not None:
+            print("  ✨ Using MarkdownElementNodeParser (table extraction mode)")
+            return await _process_with_element_parser(
+                markdown_text, filename, group_id, source_package, doc_type
+            )
+        else:
+            print("  ⚠️ MarkdownElementNodeParser not available, using fallback mode")
+            return await _process_with_fallback(
+                markdown_text, filename, group_id, source_package, doc_type
+            )
+
+    except Exception as e:
+        print(f"❌ Error processing {filename}: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+async def _process_with_element_parser(
+    markdown_text: str,
+    filename: str,
+    group_id: str,
+    source_package: str,
+    doc_type: str
+) -> dict:
+    """使用 MarkdownElementNodeParser 处理（推荐模式）"""
+    try:
+        # 使用 MarkdownElementNodeParser 解析
         node_parser = MarkdownElementNodeParser(
             num_workers=4,  # 并发处理
         )
 
         # 创建 LlamaIndex Document 对象
-        from llama_index.core import Document
         llama_doc = Document(text=markdown_text, metadata={"filename": filename})
 
         # 获取节点和对象
@@ -165,8 +196,6 @@ async def process_document_with_element_parser(
         print(f"  📊 Extracted {len(base_nodes)} text nodes")
         print(f"  📋 Extracted {len(objects)} table objects")
 
-        # 3. 分别存储文本节点和表格对象
-        doc_type = guess_doc_type(filename)
         total_stored = 0
 
         # 📌 存储文本节点
@@ -179,7 +208,7 @@ async def process_document_with_element_parser(
                         "group_id": group_id,
                         "filename": filename,
                         "doc_type": doc_type,
-                        "chunk_type": "text",  # 🆕 标记为文本
+                        "chunk_type": "text",
                         "node_index": i,
                         "source_package": source_package
                     },
@@ -191,16 +220,16 @@ async def process_document_with_element_parser(
         for i, obj in enumerate(objects):
             if obj.text.strip():
                 client.add(
-                    collection_name=TABLES_COLLECTION_NAME,  # 🆕 单独的表格集合
+                    collection_name=TABLES_COLLECTION_NAME,
                     documents=[obj.text],
                     metadata={
                         "group_id": group_id,
                         "filename": filename,
                         "doc_type": doc_type,
-                        "chunk_type": "table",  # 🆕 标记为表格
+                        "chunk_type": "table",
                         "table_index": i,
                         "source_package": source_package,
-                        "is_table": True  # 🆕 明确标记
+                        "is_table": True
                     },
                     ids=[str(uuid.uuid4())]
                 )
@@ -212,13 +241,80 @@ async def process_document_with_element_parser(
             "success": True,
             "text_nodes": len(base_nodes),
             "table_objects": len(objects),
-            "total_chunks": total_stored
+            "total_chunks": total_stored,
+            "mode": "element_parser"
         }
 
     except Exception as e:
-        print(f"❌ Error processing {filename}: {e}")
+        print(f"❌ Element Parser failed, falling back: {e}")
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
+        return await _process_with_fallback(
+            markdown_text, filename, group_id, source_package, doc_type
+        )
+
+
+async def _process_with_fallback(
+    markdown_text: str,
+    filename: str,
+    group_id: str,
+    source_package: str,
+    doc_type: str
+) -> dict:
+    """回退模式：使用大 chunk_size 保留表格完整性"""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    print("  🔄 Using fallback mode (large chunk size)")
+
+    # 使用更大的 chunk_size 减少切断表格的概率
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=4000,  # 增大到4000
+        chunk_overlap=800,  # 增大 overlap
+        separators=[
+            "\n\n##",
+            "\n\n###",
+            "\n\n",
+            "\n| ",  # 尝试在表格行前切分
+            "\n",
+            "。",
+            " ",
+            ""
+        ],
+    )
+
+    chunks = splitter.split_text(markdown_text)
+    print(f"  📊 Split into {len(chunks)} chunks")
+
+    total_stored = 0
+    for i, chunk in enumerate(chunks):
+        if chunk.strip():
+            # 检测是否包含表格
+            is_table = "|" in chunk and ("|---" in chunk or "| ===" in chunk)
+
+            client.add(
+                collection_name=COLLECTION_NAME,
+                documents=[chunk],
+                metadata={
+                    "group_id": group_id,
+                    "filename": filename,
+                    "doc_type": doc_type,
+                    "chunk_type": "table" if is_table else "text",
+                    "chunk_index": i,
+                    "source_package": source_package,
+                    "is_table": is_table
+                },
+                ids=[str(uuid.uuid4())]
+            )
+            total_stored += 1
+
+    print(f"  ✅ Stored {total_stored} chunks (fallback mode)")
+
+    return {
+        "success": True,
+        "text_nodes": len([c for c in chunks if "|" not in c]),
+        "table_objects": len([c for c in chunks if "|" in c]),
+        "total_chunks": total_stored,
+        "mode": "fallback"
+    }
 
 # ========== 核心业务端点 ==========
 
