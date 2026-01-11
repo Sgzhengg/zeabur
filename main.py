@@ -198,6 +198,23 @@ async def _process_with_element_parser(
         print(f"  📊 Extracted {len(base_nodes)} text nodes")
         print(f"  📋 Extracted {len(objects)} table objects")
 
+        # 🆕 确保集合存在
+        if not client.collection_exists(COLLECTION_NAME):
+            from qdrant_client.models import Distance, VectorParams, CreateCollection
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE)  # bge-small-zh-v1.5 的维度
+            )
+            print(f"  ✅ Created collection: {COLLECTION_NAME}")
+
+        if not client.collection_exists(TABLES_COLLECTION_NAME):
+            from qdrant_client.models import Distance, VectorParams
+            client.create_collection(
+                collection_name=TABLES_COLLECTION_NAME,
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+            )
+            print(f"  ✅ Created collection: {TABLES_COLLECTION_NAME}")
+
         total_stored = 0
 
         # 📌 存储文本节点
@@ -279,6 +296,15 @@ async def _process_with_fallback(
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     print("  🔄 Using fallback mode (large chunk size)")
+
+    # 🆕 确保集合存在
+    if not client.collection_exists(COLLECTION_NAME):
+        from qdrant_client.models import Distance, VectorParams
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+        print(f"  ✅ Created collection: {COLLECTION_NAME}")
 
     # 使用更大的 chunk_size 减少切断表格的概率
     splitter = RecursiveCharacterTextSplitter(
