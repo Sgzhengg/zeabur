@@ -511,7 +511,7 @@ async def search_docs(query: str = Form(...), limit: int = 5):
         all_results = []
 
         # 🆕 使用中文 embedding 模型
-        from qdrant_client.models import Document, QueryType
+        from qdrant_client.models import Document
 
         # 1. 搜索文本集合
         if client.collection_exists(COLLECTION_NAME):
