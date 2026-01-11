@@ -7,3 +7,10 @@ langchain-text-splitters
 fastembed
 flashrank
 redis
+llama-index-core
+llama-index-readers-llama-parse
+llama-index-node-parser
+llama-index-embeddings-fastembed
+llama-index-vector-stores-qdrant
+openai>=1.0.0
+pydantic>=2.0.0

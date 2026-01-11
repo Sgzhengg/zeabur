@@ -4,7 +4,7 @@ import shutil
 import zipfile
 import traceback
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 # 🟢 引入 Redis 库
 import redis
@@ -12,22 +12,29 @@ import redis
 from fastapi import FastAPI, UploadFile, Form, HTTPException, File
 from fastapi.middleware.cors import CORSMiddleware
 from llama_parse import LlamaParse
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 from flashrank import Ranker, RerankRequest
 from pydantic import BaseModel
+
+# 🆕 LlamaIndex 相关导入
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.readers.llama_parse import LlamaParseReader
+from llama_index.core.node_parser import MarkdownElementNodeParser
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 
 # --- 1. 环境变量读取 ---
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# 🟢 Redis 配置 (根据你的截图，默认 Host 改为 "redis")
+# 🟢 Redis 配置
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None) # 如果有密码，请在 Zeabur 变量里设置
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
 COLLECTION_NAME = "telecom_collection_v2"
+TABLES_COLLECTION_NAME = "telecom_tables_v2"  # 🆕 专门存储表格
 
 print(f"DEBUG CONFIG: QDRANT_URL={QDRANT_URL}, REDIS_HOST={REDIS_HOST}")
 
@@ -51,6 +58,9 @@ if not QDRANT_URL:
 # 初始化 Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
 
+# 🆕 初始化 Embedding 模型（用于 LlamaIndex）
+embed_model = FastEmbedEmbedding(model_name="BAAI/bge-small-zh-v1.5")
+
 @app.on_event("startup")
 def startup_event():
     print(f"🚀 Connecting to Qdrant at: {QDRANT_URL} ...")
@@ -62,9 +72,13 @@ def startup_event():
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Telecom Ingest API (With Agentic RAG Endpoints)"}
+    return {
+        "status": "ok",
+        "service": "Telecom Ingest API (With MarkdownElementNodeParser)",
+        "features": ["LlamaParse", "MarkdownElementNodeParser", "Table Extraction", "Qdrant+FlashRank"]
+    }
 
-# ========== Pydantic 数据模型（用于新端点） ==========
+# ========== Pydantic 数据模型 ==========
 
 class QueryAnalysisRequest(BaseModel):
     query: str
@@ -87,11 +101,132 @@ def guess_doc_type(filename: str) -> str:
         return "main"
     return "attachment"
 
+# ========== 🆕 核心：使用 MarkdownElementNodeParser 处理文档 ==========
+
+async def process_document_with_element_parser(
+    file_path: str,
+    filename: str,
+    group_id: str,
+    source_package: str
+) -> dict:
+    """
+    使用 MarkdownElementNodeParser 处理文档
+    分别处理文本节点和表格对象
+    """
+    print(f"📄 Processing with Element Parser: {filename}")
+
+    # 1. 使用 LlamaParse 解析文档
+    parser = LlamaParse(
+        api_key=LLAMA_CLOUD_API_KEY,
+        result_type="markdown",
+        premium_mode=True,
+        verbose=True,
+        parsing_instruction="""
+这是一个电信运营商的渠道政策文档，请按以下要求解析：
+
+【表格处理 - 最高优先级】
+1. **必须保留所有表格的完整结构**，包括嵌套表格、合并单元格
+2. **跨页表格必须合并**成一个完整的表格
+3. 表格输出为 Markdown 格式，使用标准语法
+4. **不要遗漏任何数字、金额、百分比**
+5. 保留表格标题和说明文字
+
+【文本处理】
+1. 保留所有业务名称、产品名称、活动名称
+2. 保留关键条款、条件说明、注意事项
+3. 分级标题用 # ## ### 等 Markdown 语法标注
+
+关键原则：宁可保留多余信息，也不要遗漏任何业务规则和数字！
+        """.strip()
+    )
+
+    try:
+        documents = await parser.aload_data(file_path)
+        if not documents:
+            print(f"⚠️ Warning: No text found in {filename}")
+            return {"success": False, "error": "No documents parsed"}
+
+        markdown_text = documents[0].text
+
+        # 2. 使用 MarkdownElementNodeParser 解析
+        # 🆕 这是关键：它会自动识别表格边界！
+        node_parser = MarkdownElementNodeParser(
+            num_workers=4,  # 并发处理
+        )
+
+        # 创建 LlamaIndex Document 对象
+        from llama_index.core import Document
+        llama_doc = Document(text=markdown_text, metadata={"filename": filename})
+
+        # 获取节点和对象
+        nodes = node_parser.get_nodes_from_documents([llama_doc])
+        base_nodes, objects = node_parser.get_nodes_and_objects(nodes)
+
+        print(f"  📊 Extracted {len(base_nodes)} text nodes")
+        print(f"  📋 Extracted {len(objects)} table objects")
+
+        # 3. 分别存储文本节点和表格对象
+        doc_type = guess_doc_type(filename)
+        total_stored = 0
+
+        # 📌 存储文本节点
+        for i, node in enumerate(base_nodes):
+            if node.text.strip():
+                client.add(
+                    collection_name=COLLECTION_NAME,
+                    documents=[node.text],
+                    metadata={
+                        "group_id": group_id,
+                        "filename": filename,
+                        "doc_type": doc_type,
+                        "chunk_type": "text",  # 🆕 标记为文本
+                        "node_index": i,
+                        "source_package": source_package
+                    },
+                    ids=[str(uuid.uuid4())]
+                )
+                total_stored += 1
+
+        # 📌 存储表格对象（完整表格，不被切断！）
+        for i, obj in enumerate(objects):
+            if obj.text.strip():
+                client.add(
+                    collection_name=TABLES_COLLECTION_NAME,  # 🆕 单独的表格集合
+                    documents=[obj.text],
+                    metadata={
+                        "group_id": group_id,
+                        "filename": filename,
+                        "doc_type": doc_type,
+                        "chunk_type": "table",  # 🆕 标记为表格
+                        "table_index": i,
+                        "source_package": source_package,
+                        "is_table": True  # 🆕 明确标记
+                    },
+                    ids=[str(uuid.uuid4())]
+                )
+                total_stored += 1
+
+        print(f"  ✅ Stored {total_stored} chunks (text + tables)")
+
+        return {
+            "success": True,
+            "text_nodes": len(base_nodes),
+            "table_objects": len(objects),
+            "total_chunks": total_stored
+        }
+
+    except Exception as e:
+        print(f"❌ Error processing {filename}: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
 # ========== 核心业务端点 ==========
 
 @app.post("/ingest")
 async def ingest_package(file: UploadFile = File(...), package_id: str = Form(None)):
-    """入库接口"""
+    """
+    文档入库接口 - 🆕 使用 MarkdownElementNodeParser
+    """
     if not LLAMA_CLOUD_API_KEY:
          raise HTTPException(status_code=500, detail="LLAMA_CLOUD_API_KEY not set.")
 
@@ -117,67 +252,54 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
         else:
             files_to_process.append(upload_path)
 
-        parser = LlamaParse(
-            api_key=LLAMA_CLOUD_API_KEY,
-            result_type="markdown",
-            premium_mode=True,
-            verbose=True,
-            parsing_instruction="这是一个电信运营商的政策文档，包含大量复杂的嵌套表格。请尽可能保留表格的结构，不要遗漏任何数字。如果表格跨页，请将其合并。"
-        )
+        # 🆕 统计信息
+        total_text_nodes = 0
+        total_table_objects = 0
+        processed_files = []
 
-        total_chunks = 0
-        all_points = []
-
+        # 🆕 使用新的 Element Parser 处理每个文件
         for file_path in files_to_process:
             fname = os.path.basename(file_path)
-            doc_type = guess_doc_type(fname)
-            print(f"📄 Parsing ({doc_type}): {fname}")
-
-            try:
-                documents = await parser.aload_data(file_path)
-            except Exception as parse_error:
-                print(f"❌ Parse Error on {fname}: {parse_error}")
-                continue
-
-            if not documents:
-                print(f"⚠️ Warning: No text found in {fname}")
-                continue
-
-            markdown_text = documents[0].text
-
-            splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=500)
-            chunks = splitter.split_text(markdown_text)
-
-            for i, chunk_text in enumerate(chunks):
-                all_points.append({
-                    "content": chunk_text,
-                    "metadata": {
-                        "group_id": group_id,
-                        "filename": fname,
-                        "doc_type": doc_type,
-                        "chunk_index": i,
-                        "source_package": file.filename
-                    }
-                })
-            total_chunks += len(chunks)
-
-        if total_chunks == 0:
-            return {"status": "error", "msg": "No documents parsed."}
-
-        if all_points:
-            print(f"💾 Upserting {len(all_points)} chunks...")
-            texts = [p["content"] for p in all_points]
-            metadatas = [p["metadata"] for p in all_points]
-            ids = [str(uuid.uuid4()) for _ in all_points]
-
-            client.add(
-                collection_name=COLLECTION_NAME,
-                documents=texts,
-                metadata=metadatas,
-                ids=ids
+            result = await process_document_with_element_parser(
+                file_path=file_path,
+                filename=fname,
+                group_id=group_id,
+                source_package=file.filename
             )
 
-        return {"status": "success", "group_id": group_id, "chunks": total_chunks}
+            if result["success"]:
+                total_text_nodes += result.get("text_nodes", 0)
+                total_table_objects += result.get("table_objects", 0)
+                processed_files.append({
+                    "filename": fname,
+                    "status": "success",
+                    "text_nodes": result.get("text_nodes", 0),
+                    "table_objects": result.get("table_objects", 0)
+                })
+            else:
+                processed_files.append({
+                    "filename": fname,
+                    "status": "failed",
+                    "error": result.get("error", "Unknown error")
+                })
+
+        total_chunks = total_text_nodes + total_table_objects
+
+        if total_chunks == 0:
+            return {
+                "status": "error",
+                "msg": "No documents parsed successfully.",
+                "processed_files": processed_files
+            }
+
+        return {
+            "status": "success",
+            "group_id": group_id,
+            "total_text_nodes": total_text_nodes,
+            "total_table_objects": total_table_objects,
+            "total_chunks": total_chunks,
+            "processed_files": processed_files
+        }
 
     except Exception as e:
         traceback.print_exc()
@@ -188,26 +310,30 @@ async def ingest_package(file: UploadFile = File(...), package_id: str = Form(No
 
 @app.post("/delete")
 async def delete_package(target_id: str = Form(..., description="填入 group_id 或 file_id")):
+    """删除文档 - 🆕 同时删除文本和表格"""
     try:
-        if not client.collection_exists(COLLECTION_NAME):
-             return {"status": "skipped", "msg": "Collection does not exist."}
+        # 删除主集合
+        if client.collection_exists(COLLECTION_NAME):
+            client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[models.FieldCondition(key="group_id", match=models.MatchValue(value=target_id))]
+                    )
+                )
+            )
 
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[models.FieldCondition(key="group_id", match=models.MatchValue(value=target_id))]
+        # 🆕 删除表格集合
+        if client.collection_exists(TABLES_COLLECTION_NAME):
+            client.delete(
+                collection_name=TABLES_COLLECTION_NAME,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[models.FieldCondition(key="group_id", match=models.MatchValue(value=target_id))]
+                    )
                 )
             )
-        )
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[models.FieldCondition(key="file_id", match=models.MatchValue(value=target_id))]
-                )
-            )
-        )
+
         return {"status": "deleted", "target_id": target_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -215,29 +341,33 @@ async def delete_package(target_id: str = Form(..., description="填入 group_id
 @app.post("/reset")
 async def reset_database():
     """
-    一键重置：同时清空 Qdrant 和 Redis
+    一键重置：同时清空 Qdrant（文本+表格）和 Redis
     """
     report = []
 
-    # 1. 清空 Qdrant
+    # 1. 清空主集合
     try:
         client.delete_collection(COLLECTION_NAME)
-        report.append("Qdrant collection deleted")
+        report.append("Qdrant text collection deleted")
     except Exception as e:
-        # 如果集合本来就不存在，不算错
-        report.append(f"Qdrant skipped ({str(e)})")
+        report.append(f"Qdrant text skipped ({str(e)})")
 
-    # 2. 🟢 清空 Redis (记忆)
+    # 🆕 2. 清空表格集合
     try:
-        # 连接到 Redis
+        client.delete_collection(TABLES_COLLECTION_NAME)
+        report.append("Qdrant tables collection deleted")
+    except Exception as e:
+        report.append(f"Qdrant tables skipped ({str(e)})")
+
+    # 3. 清空 Redis
+    try:
         r = redis.Redis(
             host=REDIS_HOST,
             port=REDIS_PORT,
             password=REDIS_PASSWORD,
             decode_responses=True,
-            socket_timeout=3 # 设置超时防止卡死
+            socket_timeout=3
         )
-        # 执行清空指令
         r.flushdb()
         report.append("Redis memory flushed")
     except Exception as e:
@@ -248,24 +378,55 @@ async def reset_database():
 
 @app.post("/search")
 async def search_docs(query: str = Form(...), limit: int = 5):
+    """
+    🆕 搜索接口 - 同时搜索文本和表格
+    """
     try:
-        if not client.collection_exists(COLLECTION_NAME):
+        all_results = []
+
+        # 1. 搜索文本集合
+        if client.collection_exists(COLLECTION_NAME):
+            print(f"🔎 Searching text collection for: {query}")
+            text_results = client.query(
+                collection_name=COLLECTION_NAME,
+                query_text=query,
+                limit=200  # 获取更多文本结果
+            )
+
+            for res in text_results:
+                all_results.append({
+                    "id": str(res.id),
+                    "text": res.document,
+                    "meta": res.metadata,
+                    "source": "text"
+                })
+
+        # 2. 🆕 搜索表格集合（重点！）
+        if client.collection_exists(TABLES_COLLECTION_NAME):
+            print(f"📋 Searching tables collection for: {query}")
+            table_results = client.query(
+                collection_name=TABLES_COLLECTION_NAME,
+                query_text=query,
+                limit=100  # 获取更多表格结果
+            )
+
+            for res in table_results:
+                all_results.append({
+                    "id": str(res.id),
+                    "text": res.document,
+                    "meta": res.metadata,
+                    "source": "table"  # 🆕 标记来源
+                })
+
+        if not all_results:
             return []
 
-        print(f"🔎 Searching for: {query}")
+        print(f"  📊 Found {len(all_results)} results (text + tables)")
 
-        search_result = client.query(
-            collection_name=COLLECTION_NAME,
-            query_text=query,
-            limit=300
-        )
-
-        if not search_result:
-            return []
-
+        # 3. 重排序（FlashRank）
         passages = [
-            {"id": str(res.id), "text": res.document, "meta": res.metadata}
-            for res in search_result
+            {"id": r["id"], "text": r["text"], "meta": r["meta"]}
+            for r in all_results
         ]
 
         rerank_request = RerankRequest(query=query, passages=passages)
@@ -273,11 +434,13 @@ async def search_docs(query: str = Form(...), limit: int = 5):
 
         top_results = ranked_results[:limit]
 
+        # 4. 🆕 在结果中标注来源
         return [
             {
                 "content": res["text"],
                 "score": float(res["score"]),
-                "metadata": res["meta"]
+                "metadata": res["meta"],
+                "content_type": "table" if res["meta"].get("is_table") else "text"  # 🆕 标注类型
             }
             for res in top_results
         ]
@@ -290,19 +453,15 @@ async def search_docs(query: str = Form(...), limit: int = 5):
 
 @app.post("/analyze_query")
 async def analyze_query(request: QueryAnalysisRequest):
-    """
-    分析查询复杂度，返回执行计划
-    帮助 AI Agent 决定检索策略
-    """
+    """分析查询复杂度，返回执行计划"""
     query = request.query.lower()
 
-    # 默认简单查询
     analysis = {
-        "query_type": "simple",              # simple | complex | table | aggregation
-        "sub_queries": [],                    # 分解后的子查询
-        "required_tools": ["search"],         # 需要的工具
-        "reasoning": "直接检索",              # 推理说明
-        "suggested_approach": "single_step"   # single_step | multi_step | parallel
+        "query_type": "simple",
+        "sub_queries": [],
+        "required_tools": ["search"],
+        "reasoning": "直接检索",
+        "suggested_approach": "single_step"
     }
 
     # 检测关键词
@@ -320,75 +479,66 @@ async def analyze_query(request: QueryAnalysisRequest):
 
     # 分类逻辑
     if has_comparison and has_multi_year:
-        # 复杂跨年度对比查询
         analysis["query_type"] = "complex"
         analysis["required_tools"] = ["search", "compare"]
         analysis["suggested_approach"] = "parallel"
         analysis["reasoning"] = "检测到跨年度对比查询，需要分别检索各年度文档"
 
-        # 提取年份并分解查询
         years_found = []
         for year in ["2022", "2023", "2024", "2025"]:
             if year in query:
                 years_found.append(year)
 
         if years_found:
-            # 移除年份，保留核心问题
             base_query = request.query
             for yr in years_found:
                 base_query = base_query.replace(yr, "").replace("历年", "").replace("逐年", "")
 
-            # 生成子查询
             analysis["sub_queries"] = [
                 f"{yr}年{base_query.strip()}".replace("  ", " ")
                 for yr in years_found
             ]
 
     elif has_table:
-        # 表格数据提取
         analysis["query_type"] = "table"
         analysis["required_tools"] = ["search", "extract_table"]
-        analysis["reasoning"] = "检测到表格数据查询，建议优先提取 Excel 附件"
+        analysis["reasoning"] = "检测到表格数据查询，会优先从表格集合检索"
 
     elif has_aggregation or (has_calculation and "、" in query):
-        # 数据聚合或复杂计算
         analysis["query_type"] = "aggregation"
         analysis["required_tools"] = ["search", "calculate"]
         analysis["suggested_approach"] = "multi_step"
         analysis["reasoning"] = "检测到数据聚合或复杂计算需求，建议分步检索"
 
-        # 如果包含多个问题（顿号分隔）
         if "、" in request.query:
             sub_questions = [q.strip() for q in request.query.split("、") if q.strip()]
             analysis["sub_queries"] = sub_questions
 
     else:
-        # 简单查询
-        analysis["reasoning"] = "简单查询，可直接检索"
+        analysis["reasoning"] = "简单查询，将同时搜索文本和表格"
 
     return analysis
 
 @app.post("/extract_tables")
 async def extract_tables(request: ExtractTableRequest):
     """
-    从文档中提取表格数据
-    识别 Markdown 格式的表格并返回结构化数据
+    🆕 从表格集合中提取表格数据
     """
     doc_id = request.document_id
 
     try:
-        if not client.collection_exists(COLLECTION_NAME):
+        if not client.collection_exists(TABLES_COLLECTION_NAME):
             return {
                 "document_id": doc_id,
                 "table_count": 0,
                 "tables": [],
-                "error": "Collection not found"
+                "error": "Tables collection not found"
             }
 
-        # 搜索该文档的所有片段
+        # 搜索表格集合
         search_result = client.query(
-            collection_name=COLLECTION_NAME,
-            query_text=doc_id,  # 用文档名/ID作为查询
+            collection_name=TABLES_COLLECTION_NAME,
+            query_text=doc_id,
             limit=100
         )
 
@@ -397,29 +547,24 @@ async def extract_tables(request: ExtractTableRequest):
                 "document_id": doc_id,
                 "table_count": 0,
                 "tables": [],
-                "message": "No content found for this document"
+                "message": "No tables found for this document"
             }
 
-        # 过滤并提取表格内容
         tables = []
         for res in search_result:
-            content = res.document
-
-            # 简单检测 Markdown 表格：包含 | 和分隔线
-            if "|" in content and ("|---" in content or "| ===" in content):
-                tables.append({
-                    "content": content,
-                    "source": res.metadata.get("filename", "unknown"),
-                    "chunk_id": str(res.id),
-                    "doc_type": res.metadata.get("doc_type", "unknown"),
-                    "row_count": content.count("\n") + 1  # 估算行数
-                })
+            tables.append({
+                "content": res.document,
+                "source": res.metadata.get("filename", "unknown"),
+                "chunk_id": str(res.id),
+                "table_index": res.metadata.get("table_index", 0),
+                "row_count": res.document.count("\n") + 1
+            })
 
         return {
             "document_id": doc_id,
             "total_chunks": len(search_result),
             "table_count": len(tables),
-            "tables": tables[:10]  # 最多返回10个表格，避免过大
+            "tables": tables[:10]
         }
 
     except Exception as e:
@@ -428,72 +573,87 @@ async def extract_tables(request: ExtractTableRequest):
 
 @app.post("/compare_documents")
 async def compare_documents(request: CompareDocumentsRequest):
-    """
-    跨文档对比
-    提取多个文档的关键信息，便于 Agent 进行对比分析
-    """
+    """🆕 跨文档对比 - 同时搜索文本和表格"""
     doc_ids = request.doc_ids
     results = {}
 
     try:
-        if not client.collection_exists(COLLECTION_NAME):
-            return {
-                "comparison_result": {},
-                "error": "Collection not found"
-            }
-
         for doc_id in doc_ids:
-            # 搜索每个文档
-            search_result = client.query(
-                collection_name=COLLECTION_NAME,
-                query_text=doc_id,
-                limit=50
-            )
+            # 搜索主集合
+            text_results = []
+            if client.collection_exists(COLLECTION_NAME):
+                text_search = client.query(
+                    collection_name=COLLECTION_NAME,
+                    query_text=doc_id,
+                    limit=30
+                )
+                text_results = [res.document for res in text_search[:3]]
 
-            if not search_result:
-                results[doc_id] = {
-                    "found": False,
-                    "message": "No content found"
-                }
-                continue
-
-            # 提取关键信息
-            # 1. 文件名
-            filenames = set(res.metadata.get("filename", "") for res in search_result)
-
-            # 2. 关键片段（取前3个相关度最高的）
-            key_points = [res.document for res in search_result[:3]]
-
-            # 3. 文档类型
-            doc_types = set(res.metadata.get("doc_type", "") for res in search_result)
+            # 搜索表格集合
+            table_results = []
+            if client.collection_exists(TABLES_COLLECTION_NAME):
+                table_search = client.query(
+                    collection_name=TABLES_COLLECTION_NAME,
+                    query_text=doc_id,
+                    limit=30
+                )
+                table_results = [res.document for res in table_search[:3]]
 
             results[doc_id] = {
-                "found": True,
-                "filenames": list(filenames),
-                "doc_types": list(doc_types),
-                "total_chunks": len(search_result),
-                "key_points": key_points,
-                "sample_metadata": search_result[0].metadata if search_result else {}
+                "text_chunks": len(text_results),
+                "table_chunks": len(table_results),
+                "text_samples": text_results,
+                "table_samples": table_results
             }
 
         return {
             "comparison_result": results,
-            "summary": {
-                "documents_compared": len(doc_ids),
-                "successful": sum(1 for r in results.values() if r.get("found", False)),
-                "failed": sum(1 for r in results.values() if not r.get("found", False))
-            }
+            "summary": f"对比了 {len(doc_ids)} 个文档"
         }
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ========== 🆕 统计信息端点 ==========
+
+@app.get("/stats")
+async def get_stats():
+    """获取知识库统计信息"""
+    stats = {
+        "collections": {}
+    }
+
+    # 主集合统计
+    if client.collection_exists(COLLECTION_NAME):
+        collection_info = client.get_collection(COLLECTION_NAME)
+        stats["collections"]["text"] = {
+            "name": COLLECTION_NAME,
+            "points_count": collection_info.points_count,
+            "status": "active"
+        }
+    else:
+        stats["collections"]["text"] = {"status": "not_created"}
+
+    # 表格集合统计
+    if client.collection_exists(TABLES_COLLECTION_NAME):
+        collection_info = client.get_collection(TABLES_COLLECTION_NAME)
+        stats["collections"]["tables"] = {
+            "name": TABLES_COLLECTION_NAME,
+            "points_count": collection_info.points_count,
+            "status": "active"
+        }
+    else:
+        stats["collections"]["tables"] = {"status": "not_created"}
+
+    return stats
+
 # ========== 端点总结 ==========
-# /ingest       - 文档入库（ZIP/单文件）
-# /search       - 向量搜索 + 重排序
-# /delete       - 删除文档
-# /reset        - 重置数据库（Qdrant + Redis）
-# /analyze_query - 🆕 分析查询复杂度
-# /extract_tables - 🆕 提取表格数据
-# /compare_documents - 🆕 跨文档对比
+# /ingest       - 🆕 文档入库（使用 MarkdownElementNodeParser）
+# /search       - 🆕 搜索（同时搜索文本和表格）
+# /delete       - 删除文档（同时删除文本和表格）
+# /reset        - 重置数据库（文本+表格+Redis）
+# /stats        - 🆕 统计信息
+# /analyze_query - 分析查询复杂度
+# /extract_tables - 提取表格数据
+# /compare_documents - 跨文档对比
