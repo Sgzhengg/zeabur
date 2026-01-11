@@ -62,7 +62,11 @@ if not QDRANT_URL:
     raise ValueError("❌ Fatal Error: QDRANT_URL is missing!")
 
 # 初始化 Qdrant
-client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
+client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    prefer_grpc=False
+)
 
 @app.on_event("startup")
 def startup_event():
@@ -501,44 +505,52 @@ async def reset_database():
 async def search_docs(query: str = Form(...), limit: int = 5):
     """
     🆕 搜索接口 - 同时搜索文本和表格
+    使用 query_points 替代已弃用的 query 方法
     """
     try:
         all_results = []
 
+        # 🆕 使用中文 embedding 模型
+        from qdrant_client.models import Document, QueryType
+
         # 1. 搜索文本集合
         if client.collection_exists(COLLECTION_NAME):
             print(f"🔎 Searching text collection for: {query}")
-            text_results = client.query(
+            text_results = client.query_points(
                 collection_name=COLLECTION_NAME,
-                query_text=query,
-                limit=200  # 获取更多文本结果
+                query=Document(text=query, model="BAAI/bge-small-zh-v1.5"),  # 🆕 中文模型
+                limit=200,
+                with_payload=True,
             )
 
-            for res in text_results:
+            for res in text_results.points:
                 # 🆕 从 payload 中提取数据
                 all_results.append({
                     "id": str(res.id),
-                    "text": res.payload.get("document", res.document),
-                    "meta": res.metadata if hasattr(res, 'metadata') else res.payload,
-                    "source": "text"
+                    "text": res.payload.get("document", ""),
+                    "meta": res.payload,
+                    "source": "text",
+                    "score": res.score  # 🆕 直接使用返回的 score
                 })
 
         # 2. 🆕 搜索表格集合（重点！）
         if client.collection_exists(TABLES_COLLECTION_NAME):
             print(f"📋 Searching tables collection for: {query}")
-            table_results = client.query(
+            table_results = client.query_points(
                 collection_name=TABLES_COLLECTION_NAME,
-                query_text=query,
-                limit=100  # 获取更多表格结果
+                query=Document(text=query, model="BAAI/bge-small-zh-v1.5"),  # 🆕 中文模型
+                limit=100,
+                with_payload=True,
             )
 
-            for res in table_results:
+            for res in table_results.points:
                 # 🆕 从 payload 中提取数据
                 all_results.append({
                     "id": str(res.id),
-                    "text": res.payload.get("document", res.document),
-                    "meta": res.metadata if hasattr(res, 'metadata') else res.payload,
-                    "source": "table"  # 🆕 标记来源
+                    "text": res.payload.get("document", ""),
+                    "meta": res.payload,
+                    "source": "table",
+                    "score": res.score
                 })
 
         if not all_results:
@@ -546,7 +558,7 @@ async def search_docs(query: str = Form(...), limit: int = 5):
 
         print(f"  📊 Found {len(all_results)} results (text + tables)")
 
-        # 3. 重排序（FlashRank）
+        # 3. 重排序（FlashRank）- 仍然有用，可以进一步优化结果
         passages = [
             {"id": r["id"], "text": r["text"], "meta": r["meta"]}
             for r in all_results
@@ -563,7 +575,7 @@ async def search_docs(query: str = Form(...), limit: int = 5):
                 "content": res["text"],
                 "score": float(res["score"]),
                 "metadata": res["meta"],
-                "content_type": "table" if res["meta"].get("is_table") else "text"  # 🆕 标注类型
+                "content_type": "table" if res["meta"].get("is_table") else "text"
             }
             for res in top_results
         ]
